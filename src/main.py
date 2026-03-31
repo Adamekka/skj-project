@@ -49,6 +49,9 @@ def _assert_owner(record: models.File, user_id: str) -> None:
     "/files/upload",
     response_model=schemas.UploadResponse,
     status_code=201,
+    tags=["files"],
+    summary="Upload a file",
+    response_description="Metadata of the newly stored file",
     openapi_extra={
         "requestBody": {
             "required": True,
@@ -105,7 +108,13 @@ async def upload_file(
 # ---------------------------------------------------------------------------
 
 
-@app.get("/files", response_model=List[schemas.FileRecord])
+@app.get(
+    "/files",
+    response_model=List[schemas.FileRecord],
+    tags=["files"],
+    summary="List files",
+    response_description="List of metadata records for all files owned by the requesting user",
+)
 def list_files(
     x_user_id: str = Header(default="anonymous"),
     db: Session = Depends(get_db),
@@ -119,7 +128,14 @@ def list_files(
 # ---------------------------------------------------------------------------
 
 
-@app.get("/files/{file_id}")
+@app.get(
+    "/files/{file_id}",
+    tags=["files"],
+    summary="Download a file",
+    response_description="Raw file bytes as an octet-stream",
+    # response_model is intentionally omitted: this endpoint streams raw binary
+    # data via FileResponse, which cannot be described by a Pydantic schema.
+)
 def download_file(
     file_id: str,
     x_user_id: str = Header(default="anonymous"),
@@ -144,7 +160,13 @@ def download_file(
 # ---------------------------------------------------------------------------
 
 
-@app.delete("/files/{file_id}", response_model=schemas.DeleteResponse)
+@app.delete(
+    "/files/{file_id}",
+    response_model=schemas.DeleteResponse,
+    tags=["files"],
+    summary="Delete a file",
+    response_description="Confirmation message",
+)
 def delete_file(
     file_id: str,
     x_user_id: str = Header(default="anonymous"),
