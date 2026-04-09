@@ -2,86 +2,57 @@
 
 ## Použité nástroje AI
 
-| Nástroj                           | Role                                                                    |
-| --------------------------------- | ----------------------------------------------------------------------- |
-| **OpenCode** (CLI agent)          | Plánování, generování kódu, spouštění příkazů, verifikace               |
-| **Claude Sonnet 4.6** (Anthropic) | Jazykový model uvnitř OpenCode — hlavní generátor kódu a dokumentace    |
-
----
+| Nástroj                           | Role                                                                |
+| --------------------------------- | ------------------------------------------------------------------- |
+| **OpenCode** (CLI agent)          | Plánování, úpravy kódu, generování migrací, spouštění verifikace    |
+| **GPT-5.4**                       | Návrh modelů, endpointů, Alembic konfigurace a opravy migračních chyb |
 
 ## Příklady promptů
 
-### Prompt 1 — Inicializace projektu
+### Prompt 1 — Nastavení Alembicu
 
-> Vytvoř FastAPI aplikaci simulující jednoduché S3 objektové úložiště. Aplikace musí mít:
-> - `POST /files/upload` — nahrání souboru (multipart/form-data), uložení bytů na disk
-> - `GET /files` — seznam souborů aktuálního uživatele (dle hlavičky X-User-Id)
-> - `GET /files/{id}` — stažení souboru
-> - `DELETE /files/{id}` — smazání souboru
-> Metadata ukládej do SQLite přes SQLAlchemy 2.x. Uživatelé se neautentizují — identita
-> pochází z HTTP hlavičky X-User-Id. Použij Pydantic modely pro všechny odpovědi.
+> Přidej do projektu Alembic. Inicializuj `alembic/`, nastav `alembic.ini` na SQLite databázi `storage.db` a uprav `alembic/env.py` tak, aby importoval `Base.metadata` z `src.database` a modely ze `src.models`.
 
-### Prompt 2 — Rozšíření o validaci (tato iterace)
+### Prompt 2 — Migrace 1 (Buckety)
 
-> Do stávajícího řešení přidej ke všem Pydantic schématům `Field` s `title`, `description`
-> a omezujícími parametry (min_length, ge=0 …). Každé schéma musí mít `json_schema_extra`
-> s příkladem hodnot. Endpointům přidej `tags`, `summary` a `response_description`.
-> Přidej `pydantic>=2.0.0` explicitně do requirements.txt.
+> Přidej SQLAlchemy model `Bucket` a relaci `File.bucket_id -> Bucket.id`. Vygeneruj první Alembic migraci. Pozor: v databázi už existují řádky v tabulce `files`, takže migrace nesmí předpokládat prázdnou DB.
 
-### Prompt 3 — Oprava Swagger UI (file picker)
+### Prompt 3 — Migrace 2 a 3
 
-> Swagger UI nezobrazuje input pro nahrání souboru u POST /files/upload. Oprav to tak,
-> aby se zobrazilo tlačítko "Choose File".
-
----
+> Rozšiř `Bucket` o billing sloupce `bandwidth_bytes`, `current_storage_bytes`, `ingress_bytes`, `egress_bytes`, `internal_transfer_bytes` a přidej do `File` sloupec `is_deleted`. Vygeneruj další dvě migrace a uprav FastAPI endpointy tak, aby billing počítaly při uploadu/downloadu a mazání bylo soft delete.
 
 ## Co AI vygenerovala správně
 
-- **Celková architektura** — rozdělení do `database.py`, `models.py`, `schemas.py`, `main.py`
-  odpovídá doporučené struktuře FastAPI projektů.
-- **SQLAlchemy ORM model** (`models.py`) — správně použité `Mapped[typ]` + `mapped_column`,
-  `server_default=func.now()`, indexy na `id` a `user_id`.
-- **Dependency injection** — vzor `get_db()` s `yield` a `finally: db.close()` je idiomaticky
-  správný pro FastAPI + SQLAlchemy.
-- **Ochrana před přístupem cizího uživatele** — záměrné vrácení HTTP 404 (ne 403), aby
-  se nezveřejňovala existence souboru. AI správně přidala vysvětlující komentář.
-- **Pydantic schémata** — `from_attributes = True` na `FileRecord` pro ORM-mode
-  serializaci bylo vygenerováno bez nutnosti opravy.
-- **`openapi_extra` workaround** pro file picker v Swagger UI — správně identifikovaný
-  problém s rozdílem mezi JSON Schema (`contentMediaType`) a OpenAPI (`format: binary`).
-- **Pydantic `Field` validace** — v druhé iteraci správně přidány parametry
-  `title`, `description`, `min_length`, `ge=0` a `json_schema_extra` se vzorovou hodnotou.
-- **Endpoint metadata** — `tags`, `summary`, `response_description` vygenerovány
-  konzistentně pro všechny endpointy.
-
----
+- Správně navrhla použití **Alembicu** místo `Base.metadata.create_all(...)` jako hlavního mechanismu správy schématu.
+- Správně nastavila `target_metadata = Base.metadata` a import modelů v `alembic/env.py`, takže `--autogenerate` začal detekovat změny.
+- Správně doporučila `render_as_batch=True` pro SQLite, protože SQLite neumí většinu změn tabulek provést přímo přes `ALTER TABLE`.
+- Správně navrhla oddělit migrace do tří kroků:
+  1. zavedení bucketů,
+  2. billing sloupce,
+  3. soft delete.
+- Správně doplnila Pydantic modely pro nové requesty a response (`BucketCreate`, `BucketRecord`, `ObjectUploadRequest`, `ObjectRecord`, `BucketBillingResponse`, `DeleteResponse`).
+- Správně navrhla logiku billing counters:
+  - upload zvyšuje `current_storage_bytes` a ingress/internal,
+  - download zvyšuje egress/internal,
+  - soft delete objekt fyzicky nemaže.
+- Správně zachovala kompatibilitu starých endpointů přes skryté aliasy `/files/...`, zatímco nová dokumentovaná API používají `/objects/...` a `/buckets/...`.
 
 ## Co bylo nutné opravit
 
-- **Chybějící `response_model` u stahování** — AI zpočátku přidala `response_model` i na
-  `GET /files/{id}`, který vrací `FileResponse` (binární data). To způsobovalo chybu při
-  spuštění. Bylo opraveno odstraněním `response_model` a přidáním vysvětlujícího komentáře
-  přímo do kódu.
-- **Import `pydantic` v `requirements.txt`** — AI ho nezařadila do závislostí, protože
-  Pydantic je tranzitivní závislost FastAPI. Po připomínce byl přidán explicitně
-  (`pydantic>=2.0.0`).
-- **Cesta k `storage/` adresáři** — AI generovala `STORAGE_DIR` relativně vůči souboru
-  (`os.path.dirname(__file__)`), ale skutečné soubory skončily v kořeni repozitáře
-  místo v `src/storage/`. Chování závisí na tom, odkud se spouští `uvicorn`.
+- **První migrace nebyla bezpečná pro existující data.** Autogenerate vytvořil `files.bucket_id` rovnou jako `NOT NULL`, což by na existující tabulce s daty nešlo aplikovat. Bylo nutné migraci ručně upravit:
+  - nejdřív přidat `bucket_id` jako nullable,
+  - vytvořit pro existující uživatele legacy buckety,
+  - zpětně doplnit `bucket_id` do `files`,
+  - až potom změnit sloupec na `NOT NULL`.
+- **SQLite batch foreign key musel mít jméno.** Alembic vygeneroval `create_foreign_key(None, ...)`, což při `batch_alter_table` na SQLite selhalo chybou `ValueError: Constraint must have a name`. Bylo nutné doplnit explicitní jméno `fk_files_bucket_id_buckets`.
+- **Billing migrace potřebovala data backfill.** Po přidání `current_storage_bytes` bylo nutné dopočítat aktuální uloženou velikost z tabulky `files`, jinak by billing po migraci začínal na nule i u existujících objektů.
+- **`create_all()` muselo být odstraněno z aplikace.** Jinak by se při startu aplikace schéma obcházelo mimo Alembic a mohlo by dojít k driftu mezi modely a migracemi.
+- **Cesta k úložišti byla sjednocena na kořen projektu** (`storage/`), aby odpovídala `.gitignore` a reálnému umístění už existujících souborů.
 
----
+## Jaké chyby AI udělala
 
-## Chyby AI
-
-- **Překryv `Session` a `SessionLocal`** — v první verzi AI v `main.py` použila
-  `Session(bind=engine.connect())` (vzor ze zadání) místo `SessionLocal()` ze
-  `sessionmaker`. To je nesprávné a způsobuje memory leak (každý request by vytvořil
-  nové spojení bez poolingu). Opraveno zavedením `SessionLocal` v `database.py`.
-- **`echo=True` zapomenuto** — zadání uvádí `echo=True` pro výpis raw SQL do konzole.
-  AI tuto volbu v první iteraci vynechala; bylo nutné ji doplnit ručně (pro ladění).
-- **Chybějící kontrola velikosti souboru** — AI nenavrhla omezení na maximální velikost
-  uploadu. Celý obsah souboru se načítá do paměti (`await file.read()`), což může
-  způsobit výpadek při velkých souborech. Jde o známé omezení zaznamenané v sekci Notes.
-- **`nullable=False` redundance** — SQLAlchemy 2.x odvozuje `nullable` z `Mapped[typ]`
-  (ne-optional typ = NOT NULL). AI explicitně přidala `nullable=False` ke všem sloupcům,
-  což je sice funkčně správné, ale redundantní.
+- V první verzi migrace 1 předpokládala prázdnou databázi a nevygenerovala žádný backfill existujících dat.
+- U relace `files.bucket_id -> buckets.id` nechala Alembic v batch režimu vygenerovat bezejmenný foreign key, který na SQLite neprošel.
+- Nezohlednila, že po neúspěšné ne-transakční migraci může SQLite zůstat v mezistavu a je potřeba databázi nejdřív vrátit do konzistentního stavu, než se migrace spustí znovu.
+- V původní verzi aplikace stále existovalo automatické `create_all`, i když po zavedení Alembicu už to není správný způsob správy schématu.
+- Bez doplnění ruční SQL části by migrace 2 sice přidala billing sloupce, ale neodpovídala by skutečnému stavu uložených dat.

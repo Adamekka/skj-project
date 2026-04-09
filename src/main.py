@@ -1,187 +1,290 @@
-import os
 import uuid
-from typing import List
+from pathlib import Path
 
 import aiofiles
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Path as PathParam, UploadFile
 from fastapi.responses import FileResponse
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, joinedload
 
 import src.models as models
 import src.schemas as schemas
-from src.database import Base, engine, get_db
+from src.database import get_db
 
-# Create all tables on startup.
-Base.metadata.create_all(bind=engine)
+STORAGE_DIR = Path(__file__).resolve().parent.parent / "storage"
+STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-STORAGE_DIR = os.path.join(os.path.dirname(__file__), "storage")
-os.makedirs(STORAGE_DIR, exist_ok=True)
+UPLOAD_OPENAPI_EXTRA = {
+    "requestBody": {
+        "required": True,
+        "content": {
+            "multipart/form-data": {
+                "schema": {
+                    "type": "object",
+                    "required": ["bucket_id", "file"],
+                    "properties": {
+                        "bucket_id": {"type": "integer", "minimum": 1},
+                        "file": {"type": "string", "format": "binary"},
+                    },
+                }
+            }
+        },
+    }
+}
 
 app = FastAPI(
     title="Object Storage Service",
-    description="Simple S3-inspired file storage backend.",
-    version="1.0.0",
+    description="Simple S3-inspired file storage backend with buckets and billing.",
+    version="2.0.0",
 )
 
 
-def _get_file_or_404(file_id: str, db: Session) -> models.File:
-    record = db.get(models.File, file_id)
+def _get_bucket_or_404(bucket_id: int, user_id: str, db: Session) -> models.Bucket:
+    bucket = db.scalar(
+        select(models.Bucket).where(
+            models.Bucket.id == bucket_id,
+            models.Bucket.user_id == user_id,
+        )
+    )
+    if bucket is None:
+        raise HTTPException(status_code=404, detail="Bucket not found")
+    return bucket
+
+
+def _get_object_or_404(object_id: str, user_id: str, db: Session) -> models.File:
+    record = db.scalar(
+        select(models.File)
+        .options(joinedload(models.File.bucket))
+        .where(
+            models.File.id == object_id,
+            models.File.user_id == user_id,
+            models.File.is_deleted.is_(False),
+        )
+    )
     if record is None:
-        raise HTTPException(status_code=404, detail="File not found")
+        raise HTTPException(status_code=404, detail="Object not found")
     return record
 
 
-def _assert_owner(record: models.File, user_id: str) -> None:
-    if record.user_id != user_id:
-        # Return 404 instead of 403 to avoid leaking existence of the file.
-        raise HTTPException(status_code=404, detail="File not found")
-
-
-# ---------------------------------------------------------------------------
-# POST /files/upload
-# ---------------------------------------------------------------------------
-
-
-# openapi_extra overrides the schema for the file field from FastAPI's default
-# "contentMediaType" (JSON Schema) to "format: binary" (OpenAPI) because
-# Swagger UI only recognises the latter and renders a file picker for it.
 @app.post(
-    "/files/upload",
-    response_model=schemas.UploadResponse,
+    "/buckets/",
+    response_model=schemas.BucketRecord,
     status_code=201,
-    tags=["files"],
-    summary="Upload a file",
-    response_description="Metadata of the newly stored file",
-    openapi_extra={
-        "requestBody": {
-            "required": True,
-            "content": {
-                "multipart/form-data": {
-                    "schema": {
-                        "type": "object",
-                        "required": ["file"],
-                        "properties": {
-                            "file": {"type": "string", "format": "binary"}
-                        },
-                    }
-                }
-            },
-        }
-    },
+    tags=["buckets"],
+    summary="Create a bucket",
+    response_description="Metadata of the newly created bucket",
 )
-async def upload_file(
-    file: UploadFile = File(...),
-    x_user_id: str = Header(default="anonymous"),
+def create_bucket(
+    bucket: schemas.BucketCreate,
+    x_user_id: str = Header(default="anonymous", min_length=1),
     db: Session = Depends(get_db),
 ):
-    """Upload a file and store it under storage/<user_id>/<file_id>."""
-    file_id = str(uuid.uuid4())
+    record = models.Bucket(name=bucket.name, user_id=x_user_id)
+    db.add(record)
 
-    user_dir = os.path.join(STORAGE_DIR, x_user_id)
-    os.makedirs(user_dir, exist_ok=True)
-    file_path = os.path.join(user_dir, file_id)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Bucket name already exists")
+
+    db.refresh(record)
+    return record
+
+
+@app.get(
+    "/objects/",
+    response_model=list[schemas.ObjectRecord],
+    tags=["objects"],
+    summary="List objects",
+    response_description="Non-deleted objects owned by the requesting user across all buckets",
+)
+@app.get(
+    "/files",
+    include_in_schema=False,
+    response_model=list[schemas.ObjectRecord],
+)
+def list_objects(
+    x_user_id: str = Header(default="anonymous", min_length=1),
+    db: Session = Depends(get_db),
+):
+    return db.scalars(
+        select(models.File)
+        .where(
+            models.File.user_id == x_user_id,
+            models.File.is_deleted.is_(False),
+        )
+        .order_by(models.File.created_at.desc())
+    ).all()
+
+
+@app.get(
+    "/buckets/{bucket_id}/objects/",
+    response_model=list[schemas.ObjectRecord],
+    tags=["buckets"],
+    summary="List objects in a bucket",
+    response_description="Non-deleted objects stored in the selected bucket",
+)
+def list_bucket_objects(
+    bucket_id: int = PathParam(..., ge=1),
+    x_user_id: str = Header(default="anonymous", min_length=1),
+    db: Session = Depends(get_db),
+):
+    _get_bucket_or_404(bucket_id, x_user_id, db)
+    return db.scalars(
+        select(models.File)
+        .where(
+            models.File.bucket_id == bucket_id,
+            models.File.user_id == x_user_id,
+            models.File.is_deleted.is_(False),
+        )
+        .order_by(models.File.created_at.desc())
+    ).all()
+
+
+@app.post(
+    "/objects/upload",
+    response_model=schemas.ObjectUploadResponse,
+    status_code=201,
+    tags=["objects"],
+    summary="Upload an object",
+    response_description="Metadata of the newly stored object",
+    openapi_extra=UPLOAD_OPENAPI_EXTRA,
+)
+@app.post(
+    "/files/upload",
+    include_in_schema=False,
+    response_model=schemas.ObjectUploadResponse,
+    status_code=201,
+    openapi_extra=UPLOAD_OPENAPI_EXTRA,
+)
+async def upload_object(
+    bucket_id: int = Form(...),
+    file: UploadFile = File(...),
+    x_user_id: str = Header(default="anonymous", min_length=1),
+    x_internal_source: bool = Header(default=False),
+    db: Session = Depends(get_db),
+):
+    payload = schemas.ObjectUploadRequest(bucket_id=bucket_id)
+    bucket = _get_bucket_or_404(payload.bucket_id, x_user_id, db)
+    object_id = str(uuid.uuid4())
+
+    bucket_dir = STORAGE_DIR / x_user_id / str(bucket.id)
+    bucket_dir.mkdir(parents=True, exist_ok=True)
+    object_path = bucket_dir / object_id
 
     content = await file.read()
-    async with aiofiles.open(file_path, "wb") as f:
-        await f.write(content)
+    async with aiofiles.open(object_path, "wb") as output_file:
+        await output_file.write(content)
 
     record = models.File(
-        id=file_id,
+        id=object_id,
         user_id=x_user_id,
-        filename=file.filename or file_id,
-        path=file_path,
+        bucket_id=bucket.id,
+        filename=file.filename or object_id,
+        path=str(object_path),
         size=len(content),
     )
-    db.add(record)
-    db.commit()
-    db.refresh(record)
 
-    return schemas.UploadResponse(
+    bucket.current_storage_bytes += record.size
+    bucket.bandwidth_bytes += record.size
+    if x_internal_source:
+        bucket.internal_transfer_bytes += record.size
+    else:
+        bucket.ingress_bytes += record.size
+
+    db.add(record)
+
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        if object_path.exists():
+            object_path.unlink()
+        raise
+
+    db.refresh(record)
+    return schemas.ObjectUploadResponse(
         id=record.id,
+        bucket_id=record.bucket_id,
         filename=record.filename,
         size=record.size,
     )
 
 
-# ---------------------------------------------------------------------------
-# GET /files
-# ---------------------------------------------------------------------------
-
-
 @app.get(
-    "/files",
-    response_model=List[schemas.FileRecord],
-    tags=["files"],
-    summary="List files",
-    response_description="List of metadata records for all files owned by the requesting user",
+    "/objects/{object_id}",
+    tags=["objects"],
+    summary="Download an object",
+    response_description="Raw object bytes as an octet-stream",
 )
-def list_files(
-    x_user_id: str = Header(default="anonymous"),
+@app.get("/files/{object_id}", include_in_schema=False)
+def download_object(
+    object_id: str,
+    x_user_id: str = Header(default="anonymous", min_length=1),
+    x_internal_source: bool = Header(default=False),
     db: Session = Depends(get_db),
 ):
-    """Return metadata for all files owned by the requesting user."""
-    return db.query(models.File).filter(models.File.user_id == x_user_id).all()
+    record = _get_object_or_404(object_id, x_user_id, db)
+    object_path = Path(record.path)
+    if not object_path.exists():
+        raise HTTPException(status_code=500, detail="Object data missing from disk")
 
-
-# ---------------------------------------------------------------------------
-# GET /files/{id}
-# ---------------------------------------------------------------------------
-
-
-@app.get(
-    "/files/{file_id}",
-    tags=["files"],
-    summary="Download a file",
-    response_description="Raw file bytes as an octet-stream",
-    # response_model is intentionally omitted: this endpoint streams raw binary
-    # data via FileResponse, which cannot be described by a Pydantic schema.
-)
-def download_file(
-    file_id: str,
-    x_user_id: str = Header(default="anonymous"),
-    db: Session = Depends(get_db),
-):
-    """Download the raw file bytes.  Access is restricted to the owning user."""
-    record = _get_file_or_404(file_id, db)
-    _assert_owner(record, x_user_id)
-
-    if not os.path.exists(record.path):
-        raise HTTPException(status_code=500, detail="File data missing from disk")
+    record.bucket.bandwidth_bytes += record.size
+    if x_internal_source:
+        record.bucket.internal_transfer_bytes += record.size
+    else:
+        record.bucket.egress_bytes += record.size
+    db.commit()
 
     return FileResponse(
-        path=record.path,
+        path=object_path,
         filename=record.filename,
         media_type="application/octet-stream",
     )
 
 
-# ---------------------------------------------------------------------------
-# DELETE /files/{id}
-# ---------------------------------------------------------------------------
-
-
 @app.delete(
-    "/files/{file_id}",
+    "/objects/{object_id}",
     response_model=schemas.DeleteResponse,
-    tags=["files"],
-    summary="Delete a file",
-    response_description="Confirmation message",
+    tags=["objects"],
+    summary="Soft delete an object",
+    response_description="Confirmation that the object is now hidden from listings",
 )
-def delete_file(
-    file_id: str,
-    x_user_id: str = Header(default="anonymous"),
+@app.delete(
+    "/files/{object_id}",
+    include_in_schema=False,
+    response_model=schemas.DeleteResponse,
+)
+def delete_object(
+    object_id: str,
+    x_user_id: str = Header(default="anonymous", min_length=1),
     db: Session = Depends(get_db),
 ):
-    """Delete a file from disk and remove its metadata record."""
-    record = _get_file_or_404(file_id, db)
-    _assert_owner(record, x_user_id)
-
-    # Remove bytes from disk first; if this fails we leave the DB record intact
-    # so the operator can retry or clean up manually.
-    if os.path.exists(record.path):
-        os.remove(record.path)
-
-    db.delete(record)
+    record = _get_object_or_404(object_id, x_user_id, db)
+    # Soft delete keeps the bytes on disk and in storage billing so the object
+    # can still be recovered later if the product adds an undelete flow.
+    record.is_deleted = True
     db.commit()
 
-    return schemas.DeleteResponse(message=f"File '{record.filename}' deleted.")
+    return schemas.DeleteResponse(
+        object_id=record.id,
+        is_deleted=record.is_deleted,
+        message=f"Object '{record.filename}' soft deleted.",
+    )
+
+
+@app.get(
+    "/buckets/{bucket_id}/billing/",
+    response_model=schemas.BucketBillingResponse,
+    tags=["buckets"],
+    summary="Get bucket billing",
+    response_description="Current storage and transfer counters for the selected bucket",
+)
+def get_bucket_billing(
+    bucket_id: int = PathParam(..., ge=1),
+    x_user_id: str = Header(default="anonymous", min_length=1),
+    db: Session = Depends(get_db),
+):
+    return _get_bucket_or_404(bucket_id, x_user_id, db)
