@@ -1,13 +1,25 @@
 import uuid
 from pathlib import Path
+from typing import Any
 
 import aiofiles
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Path as PathParam, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Path as PathParam,
+    UploadFile,
+)
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
+from src.broker import router as broker_router
 import src.models as models
 import src.schemas as schemas
 from src.database import get_db
@@ -15,29 +27,67 @@ from src.database import get_db
 STORAGE_DIR = Path(__file__).resolve().parent.parent / "storage"
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-UPLOAD_OPENAPI_EXTRA = {
-    "requestBody": {
-        "required": True,
-        "content": {
-            "multipart/form-data": {
-                "schema": {
-                    "type": "object",
-                    "required": ["bucket_id", "file"],
-                    "properties": {
-                        "bucket_id": {"type": "integer", "minimum": 1},
-                        "file": {"type": "string", "format": "binary"},
-                    },
-                }
-            }
-        },
-    }
-}
-
 app = FastAPI(
     title="Object Storage Service",
     description="Simple S3-inspired file storage backend with buckets and billing.",
     version="2.0.0",
 )
+app.openapi_version = "3.0.3"
+
+app.include_router(broker_router)
+
+
+def custom_openapi() -> dict[str, Any]:
+    if app.openapi_schema is not None:
+        return app.openapi_schema
+
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        openapi_version=app.openapi_version,
+        description=app.description,
+        routes=app.routes,
+    )
+
+    for path_item in openapi_schema.get("paths", {}).values():
+        for operation in path_item.values():
+            if not isinstance(operation, dict):
+                continue
+            multipart_schema = (
+                operation.get("requestBody", {})
+                .get("content", {})
+                .get("multipart/form-data", {})
+                .get("schema", {})
+            )
+            schema_ref = multipart_schema.get("$ref")
+            if not schema_ref:
+                continue
+
+            schema_name = schema_ref.removeprefix("#/components/schemas/")
+            component_schema = (
+                openapi_schema.get("components", {})
+                .get("schemas", {})
+                .get(schema_name)
+            )
+            if component_schema is None:
+                continue
+
+            for property_schema in component_schema.get("properties", {}).values():
+                if property_schema.get("type") != "string":
+                    continue
+                if "contentMediaType" not in property_schema:
+                    continue
+
+                # Swagger UI renders file pickers for `format: binary`, while the
+                # current FastAPI/Pydantic stack emits `contentMediaType` here.
+                property_schema.pop("contentMediaType", None)
+                property_schema["format"] = "binary"
+
+    app.openapi_schema = openapi_schema
+    return openapi_schema
+
+
+app.openapi = custom_openapi
 
 
 def _get_bucket_or_404(bucket_id: int, user_id: str, db: Session) -> models.Bucket:
@@ -150,24 +200,21 @@ def list_bucket_objects(
     tags=["objects"],
     summary="Upload an object",
     response_description="Metadata of the newly stored object",
-    openapi_extra=UPLOAD_OPENAPI_EXTRA,
 )
 @app.post(
     "/files/upload",
     include_in_schema=False,
     response_model=schemas.ObjectUploadResponse,
     status_code=201,
-    openapi_extra=UPLOAD_OPENAPI_EXTRA,
 )
 async def upload_object(
-    bucket_id: int = Form(...),
+    bucket_id: int = Form(..., ge=1),
     file: UploadFile = File(...),
     x_user_id: str = Header(default="anonymous", min_length=1),
     x_internal_source: bool = Header(default=False),
     db: Session = Depends(get_db),
 ):
-    payload = schemas.ObjectUploadRequest(bucket_id=bucket_id)
-    bucket = _get_bucket_or_404(payload.bucket_id, x_user_id, db)
+    bucket = _get_bucket_or_404(bucket_id, x_user_id, db)
     object_id = str(uuid.uuid4())
 
     bucket_dir = STORAGE_DIR / x_user_id / str(bucket.id)

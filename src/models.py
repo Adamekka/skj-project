@@ -54,3 +54,17 @@ class File(Base):
         Boolean, server_default=text("0"), nullable=False
     )
     bucket: Mapped[Bucket] = relationship(back_populates="files")
+
+
+class QueuedMessage(Base):
+    __tablename__ = "queued_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    topic: Mapped[str] = mapped_column(String, index=True, nullable=False)
+    payload: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+    is_delivered: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("0"), nullable=False
+    )

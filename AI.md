@@ -1,58 +1,62 @@
-# Object Storage Service - AI Report
+# Message Broker - AI Report
 
 ## Použité nástroje AI
 
-| Nástroj                           | Role                                                                |
-| --------------------------------- | ------------------------------------------------------------------- |
-| **OpenCode** (CLI agent)          | Plánování, úpravy kódu, generování migrací, spouštění verifikace    |
-| **GPT-5.4**                       | Návrh modelů, endpointů, Alembic konfigurace a opravy migračních chyb |
+| Nástroj | Role |
+| ------- | ---- |
+| OpenCode | Plánování práce, úpravy kódu, generování migrací, spouštění testů a benchmarků |
+| GPT-5.4 | Návrh ConnectionManageru, WebSocket protokolu, durable queue logiky, testů a benchmark skriptů |
 
 ## Příklady promptů
 
-### Prompt 1 — Nastavení Alembicu
+### Prompt 1 - Návrh ConnectionManageru
 
-> Přidej do projektu Alembic. Inicializuj `alembic/`, nastav `alembic.ini` na SQLite databázi `storage.db` a uprav `alembic/env.py` tak, aby importoval `Base.metadata` z `src.database` a modely ze `src.models`.
+> Navrhni jednoduchý in-memory ConnectionManager pro FastAPI WebSocket broker. Musí umět více klientů, subscriptions podle topicu, bezpečné odpojení klienta a broadcast do všech subscriberů daného topicu.
 
-### Prompt 2 — Migrace 1 (Buckety)
+### Prompt 2 - Durable queue a ACK logika
 
-> Přidej SQLAlchemy model `Bucket` a relaci `File.bucket_id -> Bucket.id`. Vygeneruj první Alembic migraci. Pozor: v databázi už existují řádky v tabulce `files`, takže migrace nesmí předpokládat prázdnou DB.
+> Přidej perzistenci zpráv do SQLite přes SQLAlchemy. Po publish se zpráva nejdřív uloží do DB s `is_delivered = False`, pak se doručí subscriberům. Po `ack` se označí jako doručená. Při novém subscribe se mají nejdřív poslat všechny nedoručené zprávy pro daný topic.
 
-### Prompt 3 — Migrace 2 a 3
+### Prompt 3 - Asynchronní WebSocket testy
 
-> Rozšiř `Bucket` o billing sloupce `bandwidth_bytes`, `current_storage_bytes`, `ingress_bytes`, `egress_bytes`, `internal_transfer_bytes` a přidej do `File` sloupec `is_deleted`. Vygeneruj další dvě migrace a uprav FastAPI endpointy tak, aby billing počítaly při uploadu/downloadu a mazání bylo soft delete.
+> Jak nejjednodušeji otestovat FastAPI WebSocket endpoint pro scénáře subscribe, publish a nedoručení do jiného topicu? Preferuj řešení, které bude spolehlivé a nebude vyžadovat externě spuštěný server.
+
+### Prompt 4 - Blokující SQLAlchemy ve WebSocket handleru
+
+> Broker běží asynchronně, ale projekt už používá synchronní SQLAlchemy Session nad SQLite. Navrhni řešení, které nebude blokovat event loop, a vysvětli proč je vhodnější než kompletní přepis na AsyncSession pro tento malý projekt.
 
 ## Co AI vygenerovala správně
 
-- Správně navrhla použití **Alembicu** místo `Base.metadata.create_all(...)` jako hlavního mechanismu správy schématu.
-- Správně nastavila `target_metadata = Base.metadata` a import modelů v `alembic/env.py`, takže `--autogenerate` začal detekovat změny.
-- Správně doporučila `render_as_batch=True` pro SQLite, protože SQLite neumí většinu změn tabulek provést přímo přes `ALTER TABLE`.
-- Správně navrhla oddělit migrace do tří kroků:
-  1. zavedení bucketů,
-  2. billing sloupce,
-  3. soft delete.
-- Správně doplnila Pydantic modely pro nové requesty a response (`BucketCreate`, `BucketRecord`, `ObjectUploadRequest`, `ObjectRecord`, `BucketBillingResponse`, `DeleteResponse`).
-- Správně navrhla logiku billing counters:
-  - upload zvyšuje `current_storage_bytes` a ingress/internal,
-  - download zvyšuje egress/internal,
-  - soft delete objekt fyzicky nemaže.
-- Správně zachovala kompatibilitu starých endpointů přes skryté aliasy `/files/...`, zatímco nová dokumentovaná API používají `/objects/...` a `/buckets/...`.
+- Správně doporučila oddělit broker do samostatných modulů místo přepisování celé `src/main.py`.
+- Správně navrhla `ConnectionManager` s mapováním `topic -> set[WebSocket]` a samostatným cleanupem při disconnectu.
+- Správně zavedla jednotný protokol zpráv přes Pydantic modely (`subscribe`, `publish`, `ack`, `deliver`, `error`).
+- Správně navrhla podporu dvou wire formátů: JSON přes textový frame a MessagePack přes binární frame.
+- Správně upozornila, že synchronní SQLAlchemy Session nesmí běžet přímo v async WebSocket handleru.
+- Správně doporučila použít `run_in_threadpool(...)` a vytvářet krátce žijící `SessionLocal()` instance uvnitř DB helper funkcí. Toto řešení bylo zvoleno, protože je malé, bezpečné a nevyžaduje přepis celé aplikace na async ORM.
+- Správně doporučila použít FastAPI/Starlette `TestClient` pro WebSocket integrační testy. To se ukázalo jako nejjednodušší a zároveň spolehlivé řešení pro tento projekt.
+- Správně navrhla benchmark skript založený na `asyncio.gather(...)` s více publishery a subscribery.
 
 ## Co bylo nutné opravit
 
-- **První migrace nebyla bezpečná pro existující data.** Autogenerate vytvořil `files.bucket_id` rovnou jako `NOT NULL`, což by na existující tabulce s daty nešlo aplikovat. Bylo nutné migraci ručně upravit:
-  - nejdřív přidat `bucket_id` jako nullable,
-  - vytvořit pro existující uživatele legacy buckety,
-  - zpětně doplnit `bucket_id` do `files`,
-  - až potom změnit sloupec na `NOT NULL`.
-- **SQLite batch foreign key musel mít jméno.** Alembic vygeneroval `create_foreign_key(None, ...)`, což při `batch_alter_table` na SQLite selhalo chybou `ValueError: Constraint must have a name`. Bylo nutné doplnit explicitní jméno `fk_files_bucket_id_buckets`.
-- **Billing migrace potřebovala data backfill.** Po přidání `current_storage_bytes` bylo nutné dopočítat aktuální uloženou velikost z tabulky `files`, jinak by billing po migraci začínal na nule i u existujících objektů.
-- **`create_all()` muselo být odstraněno z aplikace.** Jinak by se při startu aplikace schéma obcházelo mimo Alembic a mohlo by dojít k driftu mezi modely a migracemi.
-- **Cesta k úložišti byla sjednocena na kořen projektu** (`storage/`), aby odpovídala `.gitignore` a reálnému umístění už existujících souborů.
+- Původní benchmark ACKoval každou zprávu ze všech subscriberů. To zbytečně benchmarkovalo duplicitní ACK traffic do SQLite místo samotného publish/deliver výkonu. Bylo upraveno tak, že ACK posílá pouze jeden subscriber, protože databázový model má jen jeden globální příznak `is_delivered`.
+- Původní plný benchmark narážel na WebSocket keepalive timeout. Bylo nutné spouštět Uvicorn s delším `--ws-ping-interval` a `--ws-ping-timeout`, aby dlouhý běh nespadl na keepalive místo skutečného výkonového limitu.
+- Testy původně kontrolovaly stav `is_delivered` v databázi okamžitě po odeslání ACK. To bylo občas příliš brzy, protože broker ACK zpracovává asynchronně. Testy byly opraveny krátkým polling waitem.
+- Pro pytest bylo nutné doplnit `tests/conftest.py`, aby se kořen projektu přidal do `sys.path` a testy uměly importovat `src.*` moduly.
 
 ## Jaké chyby AI udělala
 
-- V první verzi migrace 1 předpokládala prázdnou databázi a nevygenerovala žádný backfill existujících dat.
-- U relace `files.bucket_id -> buckets.id` nechala Alembic v batch režimu vygenerovat bezejmenný foreign key, který na SQLite neprošel.
-- Nezohlednila, že po neúspěšné ne-transakční migraci může SQLite zůstat v mezistavu a je potřeba databázi nejdřív vrátit do konzistentního stavu, než se migrace spustí znovu.
-- V původní verzi aplikace stále existovalo automatické `create_all`, i když po zavedení Alembicu už to není správný způsob správy schématu.
-- Bez doplnění ruční SQL části by migrace 2 sice přidala billing sloupce, ale neodpovídala by skutečnému stavu uložených dat.
+- AI zpočátku podcenila, že při plném benchmarku budou keepalive timeouty reálný problém a že je potřeba upravit nastavení Uvicornu pro dlouhé WebSocket spojení.
+- AI nejdřív benchmarkovala zbytečně drahý scénář s ACK od všech subscriberů, i když datový model durable queue používá jen jeden společný `is_delivered` flag.
+- AI původně předpokládala, že stačí hned po `ack` číst databázi v testu, ale v praxi bylo potřeba počkat na doběhnutí broker loopu.
+- AI zvažovala čistě async testy přes `pytest-asyncio`, ale nakonec se ukázalo, že pro WebSocket integrační testy je jednodušší a spolehlivější `TestClient`; `httpx` zůstal použit jen pro malý async HTTP smoke test.
+
+## Zvolené řešení blokujících DB operací
+
+- Broker endpoint běží asynchronně.
+- Databázové helper funkce (`store`, `load pending`, `ack`) jsou synchronní a pracují s běžným `SessionLocal()`.
+- Tyto helper funkce se volají přes `run_in_threadpool(...)`, takže neblokují event loop.
+- Toto řešení bylo zvoleno místo `AsyncSession`, protože:
+  - projekt už měl hotový sync SQLAlchemy stack,
+  - SQLite + krátké DB operace pro cvičení fungují dobře,
+  - změna byla malá a lokální,
+  - testování i integrace s Alembicem zůstaly jednoduché.

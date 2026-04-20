@@ -13,9 +13,7 @@ class BucketCreate(BaseModel):
         pattern=r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$",
     )
 
-    model_config = {
-        "json_schema_extra": {"example": {"name": "project-assets"}}
-    }
+    model_config = {"json_schema_extra": {"example": {"name": "project-assets"}}}
 
 
 class BucketRecord(BaseModel):
