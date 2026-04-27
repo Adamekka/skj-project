@@ -131,6 +131,15 @@ def _store_queued_message(topic: str, payload: Any) -> int:
         return queued_message.id
 
 
+async def publish_persistent_message(topic: str, payload: Any) -> int:
+    message_id = await run_in_threadpool(_store_queued_message, topic, payload)
+    await manager.broadcast(
+        topic,
+        DeliverMessage(topic=topic, message_id=message_id, payload=payload),
+    )
+    return message_id
+
+
 def _load_pending_messages(topic: str) -> list[dict[str, Any]]:
     with SessionLocal() as db:
         queued_messages = db.scalars(
@@ -231,23 +240,13 @@ async def websocket_broker(websocket: WebSocket) -> None:
 
             if isinstance(inbound_message, PublishMessage):
                 try:
-                    message_id = await run_in_threadpool(
-                        _store_queued_message,
+                    await publish_persistent_message(
                         inbound_message.topic,
                         inbound_message.payload,
                     )
                 except ValueError as exc:
                     await manager.send_message(websocket, ErrorMessage(detail=str(exc)))
                     continue
-
-                await manager.broadcast(
-                    inbound_message.topic,
-                    DeliverMessage(
-                        topic=inbound_message.topic,
-                        message_id=message_id,
-                        payload=inbound_message.payload,
-                    ),
-                )
                 continue
 
             if isinstance(inbound_message, AckMessage):

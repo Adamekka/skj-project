@@ -19,7 +19,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
-from src.broker import router as broker_router
+from src.broker import publish_persistent_message, router as broker_router
+import src.image_processing as image_processing
 import src.models as models
 import src.schemas as schemas
 from src.database import get_db
@@ -257,6 +258,46 @@ async def upload_object(
         bucket_id=record.bucket_id,
         filename=record.filename,
         size=record.size,
+    )
+
+
+@app.post(
+    "/buckets/{bucket_id}/objects/{object_id}/process",
+    response_model=image_processing.ProcessObjectResponse,
+    status_code=202,
+    tags=["objects"],
+    summary="Start image processing",
+    response_description="Acknowledgement that image processing was enqueued",
+)
+async def process_object(
+    request: image_processing.ImageProcessRequest,
+    bucket_id: int = PathParam(..., ge=1),
+    object_id: str = PathParam(...),
+    x_user_id: str = Header(default="anonymous", min_length=1),
+    db: Session = Depends(get_db),
+):
+    bucket = _get_bucket_or_404(bucket_id, x_user_id, db)
+    record = _get_object_or_404(object_id, x_user_id, db)
+    if record.bucket_id != bucket.id:
+        raise HTTPException(status_code=404, detail="Object not found in bucket")
+
+    if not Path(record.path).exists():
+        raise HTTPException(status_code=500, detail="Object data missing from disk")
+
+    message_id = await publish_persistent_message(
+        image_processing.IMAGE_JOBS_TOPIC,
+        image_processing.ImageProcessJob(
+            source_bucket_id=bucket.id,
+            source_object_id=record.id,
+            source_filename=record.filename,
+            user_id=x_user_id,
+            request=request,
+        ).model_dump(mode="json"),
+    )
+    return image_processing.ProcessObjectResponse(
+        bucket_id=bucket.id,
+        object_id=record.id,
+        message_id=message_id,
     )
 
 
