@@ -47,6 +47,14 @@ class File(Base):
     # Absolute path on disk where the raw bytes are stored.
     path: Mapped[str] = mapped_column(String, nullable=False)
     size: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), server_default=text("'ready'"), nullable=False
+    )
+    volume_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
+    offset: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    uploaded_internally: Mapped[bool] = mapped_column(
+        Boolean, server_default=text("0"), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
     )

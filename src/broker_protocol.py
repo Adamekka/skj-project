@@ -1,3 +1,4 @@
+import base64
 import json
 from typing import Any, Annotated, Literal
 
@@ -56,6 +57,36 @@ OutboundBrokerMessage = Annotated[
 INBOUND_BROKER_MESSAGE_ADAPTER = TypeAdapter(InboundBrokerMessage)
 OUTBOUND_BROKER_MESSAGE_ADAPTER = TypeAdapter(OutboundBrokerMessage)
 
+BINARY_SENTINEL_KEY = "__broker_binary__"
+BINARY_VALUE_KEY = "base64"
+
+
+def encode_binary_values(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return {
+            BINARY_SENTINEL_KEY: True,
+            BINARY_VALUE_KEY: base64.b64encode(value).decode("ascii"),
+        }
+    if isinstance(value, list):
+        return [encode_binary_values(item) for item in value]
+    if isinstance(value, dict):
+        return {key: encode_binary_values(item) for key, item in value.items()}
+    return value
+
+
+def decode_binary_values(value: Any) -> Any:
+    if isinstance(value, list):
+        return [decode_binary_values(item) for item in value]
+    if isinstance(value, dict):
+        if set(value.keys()) == {BINARY_SENTINEL_KEY, BINARY_VALUE_KEY}:
+            if value[BINARY_SENTINEL_KEY] is True and isinstance(
+                value[BINARY_VALUE_KEY],
+                str,
+            ):
+                return base64.b64decode(value[BINARY_VALUE_KEY], validate=True)
+        return {key: decode_binary_values(item) for key, item in value.items()}
+    return value
+
 
 def normalize_message_format(raw_format: str | None) -> MessageFormat:
     if raw_format == "msgpack":
@@ -89,7 +120,8 @@ def encode_wire_message(
     message: BrokerMessage,
     message_format: MessageFormat,
 ) -> str | bytes:
-    payload = message.model_dump(mode="json")
     if message_format == "msgpack":
+        payload = message.model_dump(mode="python")
         return msgpack.packb(payload, use_bin_type=True)
+    payload = encode_binary_values(message.model_dump(mode="python"))
     return json.dumps(payload)

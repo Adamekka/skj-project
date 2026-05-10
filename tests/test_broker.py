@@ -221,3 +221,41 @@ def test_undelivered_message_is_replayed_after_subscribe_and_acknowledged():
             )
 
             assert _wait_for_delivery_ack(delivered.message_id) is True
+
+
+def test_msgpack_binary_payload_is_replayed_after_subscribe():
+    topic = "durable-binary-msgpack"
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/broker?format=msgpack") as publisher:
+            _send_client_message(
+                publisher,
+                PublishMessage(
+                    action="publish",
+                    topic=topic,
+                    payload={"object_id": "object-1", "data": b"image-bytes"},
+                ),
+                "msgpack",
+            )
+
+        with client.websocket_connect("/broker?format=msgpack") as subscriber:
+            _send_client_message(
+                subscriber,
+                SubscribeMessage(action="subscribe", topic=topic),
+                "msgpack",
+            )
+
+            subscribed = _receive_server_message(subscriber, "msgpack")
+            assert isinstance(subscribed, SubscribedMessage)
+
+            delivered = _receive_server_message(subscriber, "msgpack")
+            assert isinstance(delivered, DeliverMessage)
+            assert delivered.payload == {"object_id": "object-1", "data": b"image-bytes"}
+
+            _send_client_message(
+                subscriber,
+                AckMessage(action="ack", message_id=delivered.message_id),
+                "msgpack",
+            )
+
+            assert _wait_for_delivery_ack(delivered.message_id) is True

@@ -1,8 +1,12 @@
+import asyncio
+import os
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-import aiofiles
+import httpx
+import websockets
 from fastapi import (
     Depends,
     FastAPI,
@@ -13,25 +17,68 @@ from fastapi import (
     Path as PathParam,
     UploadFile,
 )
+from fastapi.concurrency import run_in_threadpool
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import FileResponse
-from sqlalchemy import select
+from fastapi.responses import FileResponse, Response
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
-from src.broker import publish_persistent_message, router as broker_router
+from src.broker import (
+    create_queued_message,
+    manager,
+    publish_persistent_message,
+    router as broker_router,
+)
+from src.broker_protocol import (
+    AckMessage,
+    DeliverMessage,
+    ErrorMessage,
+    MessageFormat,
+    SubscribeMessage,
+    SubscribedMessage,
+    decode_server_message,
+    encode_wire_message,
+)
 import src.image_processing as image_processing
 import src.models as models
 import src.schemas as schemas
-from src.database import get_db
+from src.database import SessionLocal, get_db
+from src.storage_protocol import (
+    STORAGE_ACK_TOPIC,
+    STORAGE_WRITE_TOPIC,
+    haystack_location_path,
+    websocket_url,
+)
 
 STORAGE_DIR = Path(__file__).resolve().parent.parent / "storage"
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+HAYSTACK_BASE_URL = os.getenv("HAYSTACK_BASE_URL", "http://127.0.0.1:8001")
+GATEWAY_BROKER_URL = os.getenv("GATEWAY_BROKER_URL", "ws://127.0.0.1:8000/broker")
+STORAGE_ACK_LISTENER_ENABLED = os.getenv("STORAGE_ACK_LISTENER_ENABLED", "1") != "0"
+STORAGE_ACK_RECONNECT_DELAY_SECONDS = 0.2
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    storage_ack_task: asyncio.Task | None = None
+    if STORAGE_ACK_LISTENER_ENABLED:
+        storage_ack_task = asyncio.create_task(_storage_ack_listener())
+        app.state.storage_ack_task = storage_ack_task
+
+    try:
+        yield
+    finally:
+        if storage_ack_task is not None:
+            storage_ack_task.cancel()
+            await asyncio.gather(storage_ack_task, return_exceptions=True)
+
 
 app = FastAPI(
     title="Object Storage Service",
     description="Simple S3-inspired file storage backend with buckets and billing.",
     version="2.0.0",
+    lifespan=lifespan,
 )
 app.openapi_version = "3.0.3"
 
@@ -118,6 +165,99 @@ def _get_object_or_404(object_id: str, user_id: str, db: Session) -> models.File
     return record
 
 
+def _apply_storage_ack(payload: dict[str, Any]) -> None:
+    object_id = payload.get("object_id")
+    volume_id = payload.get("volume_id")
+    offset = payload.get("offset")
+    size = payload.get("size")
+    if not isinstance(object_id, str):
+        return
+    if (
+        not isinstance(volume_id, int)
+        or not isinstance(offset, int)
+        or not isinstance(size, int)
+    ):
+        return
+
+    with SessionLocal() as db:
+        result = db.execute(
+            update(models.File)
+            .where(models.File.id == object_id, models.File.status != "ready")
+            .values(
+                volume_id=volume_id,
+                offset=offset,
+                size=size,
+                status="ready",
+                path=haystack_location_path(volume_id, offset, size),
+            )
+        )
+        if result.rowcount != 1:
+            record = db.get(models.File, object_id)
+            if record is not None:
+                record.volume_id = volume_id
+                record.offset = offset
+                record.size = size
+                record.path = haystack_location_path(volume_id, offset, size)
+                db.commit()
+            return
+
+        record = db.get(models.File, object_id)
+        if record is None:
+            db.commit()
+            return
+
+        record.bucket.current_storage_bytes += size
+        record.bucket.bandwidth_bytes += size
+        if record.uploaded_internally:
+            record.bucket.internal_transfer_bytes += size
+        else:
+            record.bucket.ingress_bytes += size
+
+        db.commit()
+
+
+async def _send_broker_message(
+    websocket: websockets.ClientConnection,
+    message: SubscribeMessage | AckMessage,
+    message_format: MessageFormat,
+) -> None:
+    await websocket.send(encode_wire_message(message, message_format))
+
+
+async def _storage_ack_listener() -> None:
+    message_format: MessageFormat = "msgpack"
+    broker_url = websocket_url(GATEWAY_BROKER_URL, message_format)
+
+    while True:
+        try:
+            async with websockets.connect(broker_url, max_size=None) as websocket:
+                await _send_broker_message(
+                    websocket,
+                    SubscribeMessage(action="subscribe", topic=STORAGE_ACK_TOPIC),
+                    message_format,
+                )
+
+                while True:
+                    server_message = decode_server_message(await websocket.recv())
+                    if isinstance(server_message, SubscribedMessage):
+                        continue
+                    if isinstance(server_message, ErrorMessage):
+                        continue
+                    if not isinstance(server_message, DeliverMessage):
+                        continue
+                    if isinstance(server_message.payload, dict):
+                        await run_in_threadpool(_apply_storage_ack, server_message.payload)
+                    await _send_broker_message(
+                        websocket,
+                        AckMessage(action="ack", message_id=server_message.message_id),
+                        message_format,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await asyncio.sleep(STORAGE_ACK_RECONNECT_DELAY_SECONDS)
+
+
 @app.post(
     "/buckets/",
     response_model=schemas.BucketRecord,
@@ -197,16 +337,16 @@ def list_bucket_objects(
 @app.post(
     "/objects/upload",
     response_model=schemas.ObjectUploadResponse,
-    status_code=201,
+    status_code=202,
     tags=["objects"],
     summary="Upload an object",
-    response_description="Metadata of the newly stored object",
+    response_description="Metadata of the accepted object upload",
 )
 @app.post(
     "/files/upload",
     include_in_schema=False,
     response_model=schemas.ObjectUploadResponse,
-    status_code=201,
+    status_code=202,
 )
 async def upload_object(
     bucket_id: int = Form(..., ge=1),
@@ -217,47 +357,48 @@ async def upload_object(
 ):
     bucket = _get_bucket_or_404(bucket_id, x_user_id, db)
     object_id = str(uuid.uuid4())
-
-    bucket_dir = STORAGE_DIR / x_user_id / str(bucket.id)
-    bucket_dir.mkdir(parents=True, exist_ok=True)
-    object_path = bucket_dir / object_id
-
     content = await file.read()
-    async with aiofiles.open(object_path, "wb") as output_file:
-        await output_file.write(content)
 
     record = models.File(
         id=object_id,
         user_id=x_user_id,
         bucket_id=bucket.id,
         filename=file.filename or object_id,
-        path=str(object_path),
+        path=f"haystack://pending/{object_id}",
         size=len(content),
+        status="uploading",
+        uploaded_internally=x_internal_source,
     )
 
-    bucket.current_storage_bytes += record.size
-    bucket.bandwidth_bytes += record.size
-    if x_internal_source:
-        bucket.internal_transfer_bytes += record.size
-    else:
-        bucket.ingress_bytes += record.size
-
+    storage_payload = {
+        "object_id": record.id,
+        "data": content,
+    }
     db.add(record)
+    queued_message = create_queued_message(db, STORAGE_WRITE_TOPIC, storage_payload)
+    message_id = queued_message.id
 
     try:
         db.commit()
     except Exception:
         db.rollback()
-        if object_path.exists():
-            object_path.unlink()
         raise
 
-    db.refresh(record)
+    await manager.broadcast(
+        STORAGE_WRITE_TOPIC,
+        DeliverMessage(
+            topic=STORAGE_WRITE_TOPIC,
+            message_id=message_id,
+            payload=storage_payload,
+        ),
+    )
+
     return schemas.ObjectUploadResponse(
         id=record.id,
         bucket_id=record.bucket_id,
         filename=record.filename,
         size=record.size,
+        status="uploading",
     )
 
 
@@ -281,7 +422,9 @@ async def process_object(
     if record.bucket_id != bucket.id:
         raise HTTPException(status_code=404, detail="Object not found in bucket")
 
-    if not Path(record.path).exists():
+    if record.status != "ready":
+        raise HTTPException(status_code=409, detail="Object is still uploading")
+    if record.volume_id is None and not Path(record.path).exists():
         raise HTTPException(status_code=500, detail="Object data missing from disk")
 
     message_id = await publish_persistent_message(
@@ -303,21 +446,52 @@ async def process_object(
 
 @app.get(
     "/objects/{object_id}",
+    include_in_schema=False,
+    tags=["objects"],
+    summary="Download an object",
+    response_description="Raw object bytes as an octet-stream",
+)
+@app.get(
+    "/download/{object_id}",
     tags=["objects"],
     summary="Download an object",
     response_description="Raw object bytes as an octet-stream",
 )
 @app.get("/files/{object_id}", include_in_schema=False)
-def download_object(
+async def download_object(
     object_id: str,
     x_user_id: str = Header(default="anonymous", min_length=1),
     x_internal_source: bool = Header(default=False),
     db: Session = Depends(get_db),
 ):
     record = _get_object_or_404(object_id, x_user_id, db)
-    object_path = Path(record.path)
-    if not object_path.exists():
-        raise HTTPException(status_code=500, detail="Object data missing from disk")
+    if record.status != "ready":
+        raise HTTPException(status_code=409, detail="Object is still uploading")
+    if record.volume_id is None or record.offset is None:
+        # Rows created before Haystack migration only have a local disk path.
+        object_path = Path(record.path)
+        if not object_path.exists():
+            raise HTTPException(status_code=500, detail="Object data missing from disk")
+
+        record.bucket.bandwidth_bytes += record.size
+        if x_internal_source:
+            record.bucket.internal_transfer_bytes += record.size
+        else:
+            record.bucket.egress_bytes += record.size
+        db.commit()
+
+        return FileResponse(
+            path=object_path,
+            filename=record.filename,
+            media_type="application/octet-stream",
+        )
+
+    async with httpx.AsyncClient(base_url=HAYSTACK_BASE_URL, timeout=30.0) as client:
+        response = await client.get(
+            f"/volume/{record.volume_id}/{record.offset}/{record.size}"
+        )
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail="Object data unavailable")
 
     record.bucket.bandwidth_bytes += record.size
     if x_internal_source:
@@ -326,15 +500,17 @@ def download_object(
         record.bucket.egress_bytes += record.size
     db.commit()
 
-    return FileResponse(
-        path=object_path,
-        filename=record.filename,
+    filename = record.filename.replace('"', "")
+    return Response(
+        content=response.content,
         media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
 @app.delete(
     "/objects/{object_id}",
+    include_in_schema=False,
     response_model=schemas.DeleteResponse,
     tags=["objects"],
     summary="Soft delete an object",
@@ -344,6 +520,13 @@ def download_object(
     "/files/{object_id}",
     include_in_schema=False,
     response_model=schemas.DeleteResponse,
+)
+@app.delete(
+    "/download/{object_id}",
+    response_model=schemas.DeleteResponse,
+    tags=["objects"],
+    summary="Soft delete an object",
+    response_description="Confirmation that the object is now hidden from listings",
 )
 def delete_object(
     object_id: str,
@@ -361,6 +544,90 @@ def delete_object(
         is_deleted=record.is_deleted,
         message=f"Object '{record.filename}' soft deleted.",
     )
+
+
+@app.get(
+    "/admin/volumes/{volume_id}/objects",
+    response_model=list[schemas.VolumeObjectRecord],
+    tags=["admin"],
+    summary="List live objects in a Haystack volume",
+)
+def list_volume_objects(
+    volume_id: int = PathParam(..., ge=1),
+    db: Session = Depends(get_db),
+):
+    records = db.scalars(
+        select(models.File)
+        .where(
+            models.File.volume_id == volume_id,
+            models.File.status == "ready",
+            models.File.is_deleted.is_(False),
+            models.File.offset.is_not(None),
+        )
+        .order_by(models.File.offset.asc())
+    ).all()
+
+    return [
+        schemas.VolumeObjectRecord(
+            object_id=record.id,
+            volume_id=record.volume_id,
+            offset=record.offset,
+            size=record.size,
+        )
+        for record in records
+        if record.volume_id is not None and record.offset is not None
+    ]
+
+
+@app.patch(
+    "/admin/objects/{object_id}/location",
+    response_model=schemas.ObjectLocationResponse,
+    tags=["admin"],
+    summary="Update an object Haystack location",
+)
+def update_object_location(
+    location: schemas.ObjectLocationUpdate,
+    object_id: str,
+    db: Session = Depends(get_db),
+):
+    record = db.get(models.File, object_id)
+    if record is None or record.is_deleted:
+        raise HTTPException(status_code=404, detail="Object not found")
+
+    record.volume_id = location.volume_id
+    record.offset = location.offset
+    record.size = location.size
+    record.status = "ready"
+    record.path = haystack_location_path(location.volume_id, location.offset, location.size)
+    db.commit()
+
+    return schemas.ObjectLocationResponse(
+        object_id=record.id,
+        volume_id=record.volume_id,
+        offset=record.offset,
+        size=record.size,
+        status=record.status,
+    )
+
+
+@app.post(
+    "/admin/volumes/{volume_id}/compact",
+    response_model=schemas.CompactVolumeResponse,
+    tags=["admin"],
+    summary="Compact a Haystack volume",
+)
+async def compact_volume(
+    volume_id: int = PathParam(..., ge=1),
+):
+    async with httpx.AsyncClient(base_url=HAYSTACK_BASE_URL, timeout=60.0) as client:
+        response = await client.post(f"/admin/volumes/{volume_id}/compact")
+
+    if response.status_code == 404:
+        raise HTTPException(status_code=404, detail="Volume not found")
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail="Haystack compaction failed")
+
+    return response.json()
 
 
 @app.get(

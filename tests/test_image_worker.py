@@ -13,6 +13,7 @@ from PIL import Image
 from sqlalchemy import delete, select
 
 import src.image_processing as image_processing
+import src.haystack as haystack_module
 import src.main as main_module
 import src.models as models
 from src.broker import manager
@@ -52,15 +53,24 @@ def _create_bucket_and_object(client, user_id: str, bucket_name: str) -> tuple[i
     assert create_bucket.status_code == 201
 
     bucket_id = create_bucket.json()["id"]
+    image_bytes = _make_png_bytes()
     upload = client.post(
         "/objects/upload",
         headers={"X-User-Id": user_id},
         data={"bucket_id": str(bucket_id)},
-        files={"file": ("source.png", _make_png_bytes(), "image/png")},
+        files={"file": ("source.png", image_bytes, "image/png")},
     )
-    assert upload.status_code == 201
+    assert upload.status_code == 202
 
     payload = upload.json()
+    main_module._apply_storage_ack(
+        {
+            "object_id": payload["id"],
+            "volume_id": 1,
+            "offset": 0,
+            "size": len(image_bytes),
+        }
+    )
     return bucket_id, payload["id"], payload["filename"]
 
 
@@ -100,6 +110,19 @@ async def _wait_for_server(base_url: str) -> None:
             await asyncio.sleep(0.05)
 
 
+async def _wait_for_object_ready(object_id: str) -> None:
+    deadline = asyncio.get_running_loop().time() + 10.0
+    while True:
+        with SessionLocal() as db:
+            record = db.get(models.File, object_id)
+            if record is not None and record.status == "ready":
+                return
+
+        if asyncio.get_running_loop().time() >= deadline:
+            raise TimeoutError(f"Timed out waiting for object {object_id} to be ready.")
+        await asyncio.sleep(0.05)
+
+
 @pytest.fixture(autouse=True)
 def cleanup_broker_state():
     with SessionLocal() as db:
@@ -121,27 +144,51 @@ async def live_server(monkeypatch, tmp_path):
     monkeypatch.setattr(main_module, "STORAGE_DIR", tmp_path)
     main_module.STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-    port = _get_free_port()
+    gateway_port = _get_free_port()
+    haystack_port = _get_free_port()
+    gateway_base_url = f"http://127.0.0.1:{gateway_port}"
+    haystack_base_url = f"http://127.0.0.1:{haystack_port}"
+    broker_url = f"ws://127.0.0.1:{gateway_port}/broker"
+
+    monkeypatch.setattr(main_module, "GATEWAY_BROKER_URL", broker_url)
+    monkeypatch.setattr(main_module, "HAYSTACK_BASE_URL", haystack_base_url)
+    monkeypatch.setattr(haystack_module, "HAYSTACK_BROKER_URL", broker_url)
+    monkeypatch.setattr(haystack_module, "VOLUME_DIR", tmp_path / "haystack")
+    monkeypatch.setattr(haystack_module, "MAX_VOLUME_BYTES", 100 * 1024 * 1024)
+
     config = uvicorn.Config(
         app,
         host="127.0.0.1",
-        port=port,
+        port=gateway_port,
         log_level="warning",
         ws_ping_interval=600,
         ws_ping_timeout=600,
     )
     server = uvicorn.Server(config)
     server_task = asyncio.create_task(server.serve())
+    await _wait_for_server(gateway_base_url)
 
-    base_url = f"http://127.0.0.1:{port}"
-    await _wait_for_server(base_url)
+    haystack_config = uvicorn.Config(
+        haystack_module.app,
+        host="127.0.0.1",
+        port=haystack_port,
+        log_level="warning",
+        ws_ping_interval=600,
+        ws_ping_timeout=600,
+    )
+    haystack_server = uvicorn.Server(haystack_config)
+    haystack_task = asyncio.create_task(haystack_server.serve())
+    await _wait_for_server(haystack_base_url)
 
     try:
         yield {
-            "http_base_url": base_url,
-            "broker_url": f"ws://127.0.0.1:{port}/broker",
+            "http_base_url": gateway_base_url,
+            "broker_url": broker_url,
+            "haystack_base_url": haystack_base_url,
         }
     finally:
+        haystack_server.should_exit = True
+        await asyncio.wait_for(haystack_task, timeout=10.0)
         server.should_exit = True
         await asyncio.wait_for(server_task, timeout=10.0)
 
@@ -207,6 +254,59 @@ def test_process_endpoint_enqueues_image_job(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_gateway_upload_ack_download_and_soft_delete(live_server):
+    user_id = f"gateway-{uuid.uuid4().hex}"
+    bucket_name = f"bucket-{uuid.uuid4().hex[:20]}"
+    image_bytes = _make_png_bytes((10, 20, 30))
+
+    try:
+        async with httpx.AsyncClient(
+            base_url=live_server["http_base_url"],
+            timeout=30.0,
+        ) as client:
+            create_bucket = await client.post(
+                "/buckets/",
+                headers={"X-User-Id": user_id},
+                json={"name": bucket_name},
+            )
+            assert create_bucket.status_code == 201
+            bucket_id = create_bucket.json()["id"]
+
+            upload = await client.post(
+                "/objects/upload",
+                headers={"X-User-Id": user_id},
+                data={"bucket_id": str(bucket_id)},
+                files={"file": ("source.png", image_bytes, "image/png")},
+            )
+            assert upload.status_code == 202
+            object_id = upload.json()["id"]
+
+            await _wait_for_object_ready(object_id)
+
+            download = await client.get(
+                f"/download/{object_id}",
+                headers={"X-User-Id": user_id},
+            )
+            assert download.status_code == 200
+            assert download.content == image_bytes
+
+            delete_response = await client.delete(
+                f"/download/{object_id}",
+                headers={"X-User-Id": user_id},
+            )
+            assert delete_response.status_code == 200
+            assert delete_response.json()["is_deleted"] is True
+
+            deleted_download = await client.get(
+                f"/download/{object_id}",
+                headers={"X-User-Id": user_id},
+            )
+            assert deleted_download.status_code == 404
+    finally:
+        _delete_user_data(user_id)
+
+
+@pytest.mark.asyncio
 async def test_worker_processes_ten_jobs_and_emits_ten_done_messages(live_server):
     user_id = f"worker-{uuid.uuid4().hex}"
     bucket_name = f"bucket-{uuid.uuid4().hex[:20]}"
@@ -230,8 +330,9 @@ async def test_worker_processes_ten_jobs_and_emits_ten_done_messages(live_server
                 data={"bucket_id": str(bucket_id)},
                 files={"file": ("source.png", _make_png_bytes(), "image/png")},
             )
-            assert upload.status_code == 201
+            assert upload.status_code == 202
             source_payload = upload.json()
+            await _wait_for_object_ready(source_payload["id"])
 
         ready_event = asyncio.Event()
         worker_task = asyncio.create_task(

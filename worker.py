@@ -89,9 +89,29 @@ async def _upload_processed_object(
         data={"bucket_id": str(job.source_bucket_id)},
         files={"file": (result_filename, image_bytes, "image/png")},
     )
-    if response.status_code != 201:
+    if response.status_code != 202:
         raise ValueError(f"Processed upload failed with status {response.status_code}.")
     return response.json()
+
+
+async def _wait_for_object_ready(
+    client: httpx.AsyncClient,
+    object_id: str,
+    user_id: str,
+) -> None:
+    deadline = asyncio.get_running_loop().time() + 10.0
+    while True:
+        response = await client.get("/objects/", headers={"X-User-Id": user_id})
+        if response.status_code != 200:
+            raise ValueError(f"Object readiness check failed with status {response.status_code}.")
+
+        for record in response.json():
+            if record["id"] == object_id and record["status"] == "ready":
+                return
+
+        if asyncio.get_running_loop().time() >= deadline:
+            raise TimeoutError(f"Timed out waiting for object {object_id} to be ready.")
+        await asyncio.sleep(0.05)
 
 
 async def _build_done_payload(
@@ -112,6 +132,7 @@ async def _build_done_payload(
         source_bytes = await _download_source_object(client, job)
         processed_bytes = process_image_bytes(source_bytes, job.request)
         upload_payload = await _upload_processed_object(client, job, processed_bytes)
+        await _wait_for_object_ready(client, upload_payload["id"], job.user_id)
         return ImageJobCompletedEvent(
             source_bucket_id=job.source_bucket_id,
             source_object_id=job.source_object_id,

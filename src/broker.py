@@ -7,6 +7,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.concurrency import run_in_threadpool
 from pydantic import ValidationError
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 import src.models as models
 from src.broker_protocol import (
@@ -18,12 +19,16 @@ from src.broker_protocol import (
     SubscribeMessage,
     SubscribedMessage,
     decode_wire_message,
+    decode_binary_values,
+    encode_binary_values,
     encode_wire_message,
     normalize_message_format,
 )
 from src.database import SessionLocal
 
 router = APIRouter()
+PERSISTED_PAYLOAD_SENTINEL_KEY = "__broker_persisted_payload__"
+PERSISTED_PAYLOAD_VALUE_KEY = "payload"
 
 
 class ConnectionManager:
@@ -117,9 +122,44 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+def _serialize_persisted_payload(payload: Any) -> str:
+    return json.dumps(
+        {
+            PERSISTED_PAYLOAD_SENTINEL_KEY: True,
+            PERSISTED_PAYLOAD_VALUE_KEY: encode_binary_values(payload),
+        }
+    )
+
+
+def _deserialize_persisted_payload(serialized_payload: str) -> Any:
+    decoded = json.loads(serialized_payload)
+    if isinstance(decoded, dict):
+        if set(decoded.keys()) == {
+            PERSISTED_PAYLOAD_SENTINEL_KEY,
+            PERSISTED_PAYLOAD_VALUE_KEY,
+        }:
+            if decoded[PERSISTED_PAYLOAD_SENTINEL_KEY] is True:
+                return decode_binary_values(decoded[PERSISTED_PAYLOAD_VALUE_KEY])
+    return decoded
+
+
+def create_queued_message(
+    db: Session,
+    topic: str,
+    payload: Any,
+) -> models.QueuedMessage:
+    queued_message = models.QueuedMessage(
+        topic=topic,
+        payload=_serialize_persisted_payload(payload),
+    )
+    db.add(queued_message)
+    db.flush()
+    return queued_message
+
+
 def _store_queued_message(topic: str, payload: Any) -> int:
     try:
-        serialized_payload = json.dumps(payload)
+        serialized_payload = _serialize_persisted_payload(payload)
     except TypeError as exc:
         raise ValueError("Payload must be JSON serializable for persistence.") from exc
 
@@ -155,7 +195,7 @@ def _load_pending_messages(topic: str) -> list[dict[str, Any]]:
             {
                 "topic": queued_message.topic,
                 "message_id": queued_message.id,
-                "payload": json.loads(queued_message.payload),
+                "payload": _deserialize_persisted_payload(queued_message.payload),
             }
             for queued_message in queued_messages
         ]

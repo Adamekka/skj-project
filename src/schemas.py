@@ -90,6 +90,12 @@ class ObjectUploadResponse(BaseModel):
         description="Size of the uploaded object in bytes.",
         ge=0,
     )
+    status: str = Field(
+        ...,
+        title="Object Status",
+        description="Current persistence state of the object.",
+        min_length=1,
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -98,6 +104,7 @@ class ObjectUploadResponse(BaseModel):
                 "bucket_id": 1,
                 "filename": "invoice.pdf",
                 "size": 204800,
+                "status": "uploading",
             }
         }
     }
@@ -133,6 +140,24 @@ class ObjectRecord(BaseModel):
         description="Size of the stored object in bytes.",
         ge=0,
     )
+    status: str = Field(
+        ...,
+        title="Object Status",
+        description="Current persistence state of the object.",
+        min_length=1,
+    )
+    volume_id: int | None = Field(
+        default=None,
+        title="Volume ID",
+        description="Haystack volume that contains the object bytes.",
+        ge=1,
+    )
+    offset: int | None = Field(
+        default=None,
+        title="Volume Offset",
+        description="Byte offset where the object starts inside its Haystack volume.",
+        ge=0,
+    )
     created_at: datetime = Field(
         ...,
         title="Created At",
@@ -148,6 +173,9 @@ class ObjectRecord(BaseModel):
                 "user_id": "alice",
                 "filename": "invoice.pdf",
                 "size": 204800,
+                "status": "ready",
+                "volume_id": 1,
+                "offset": 10560,
                 "created_at": "2026-04-09T20:05:00Z",
             }
         },
@@ -242,3 +270,80 @@ class DeleteResponse(BaseModel):
             }
         }
     }
+
+
+class VolumeObjectRecord(BaseModel):
+    object_id: str = Field(
+        ...,
+        title="Object ID",
+        description="Unique UUID identifier of the stored object.",
+    )
+    volume_id: int = Field(
+        ...,
+        title="Volume ID",
+        description="Haystack volume that contains the object bytes.",
+        ge=1,
+    )
+    offset: int = Field(
+        ...,
+        title="Volume Offset",
+        description="Byte offset where the object starts inside its Haystack volume.",
+        ge=0,
+    )
+    size: int = Field(
+        ...,
+        title="Object Size",
+        description="Size of the stored object in bytes.",
+        ge=0,
+    )
+
+
+class ObjectLocationUpdate(BaseModel):
+    volume_id: int = Field(
+        ...,
+        title="Volume ID",
+        description="Haystack volume that contains the object bytes.",
+        ge=1,
+    )
+    offset: int = Field(
+        ...,
+        title="Volume Offset",
+        description="Byte offset where the object starts inside its Haystack volume.",
+        ge=0,
+    )
+    size: int = Field(
+        ...,
+        title="Object Size",
+        description="Size of the stored object in bytes.",
+        ge=0,
+    )
+
+
+class ObjectLocationResponse(VolumeObjectRecord):
+    status: str = Field(
+        ...,
+        title="Object Status",
+        description="Current persistence state of the object.",
+        min_length=1,
+    )
+
+
+class CompactVolumeResponse(BaseModel):
+    volume_id: int = Field(
+        ...,
+        title="Volume ID",
+        description="Haystack volume that was compacted.",
+        ge=1,
+    )
+    moved_objects: int = Field(
+        ...,
+        title="Moved Objects",
+        description="Number of live objects copied into the compacted volume.",
+        ge=0,
+    )
+    bytes_written: int = Field(
+        ...,
+        title="Bytes Written",
+        description="Total number of live bytes written into the compacted volume.",
+        ge=0,
+    )
